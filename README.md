@@ -5,7 +5,7 @@ The reliability layer for AI agents in production. Trace executions, enforce gua
 ## Installation
 
 ```bash
-pip install agentguard
+pip install agent-x-ai
 ```
 
 ## Quick Start

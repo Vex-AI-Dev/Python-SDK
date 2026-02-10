@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentguard"
+name = "agent-x-ai"
 version = "0.1.0"
 description = "The reliability layer for AI agents in production"
 requires-python = ">=3.9"
