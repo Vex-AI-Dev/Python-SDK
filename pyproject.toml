@@ -46,6 +46,9 @@ Repository = "https://github.com/Agent-X-AI/Python-SDK"
 Documentation = "https://docs.oppla.ai/agentguard"
 "Issue Tracker" = "https://github.com/Agent-X-AI/Python-SDK/issues"
 
+[tool.hatch.build.targets.wheel]
+packages = ["agentguard"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
