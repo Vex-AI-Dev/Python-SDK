@@ -1,4 +1,4 @@
-"""HTTP transport layer for sending telemetry to AgentGuard backend services.
+"""HTTP transport layer for sending telemetry to Vex backend services.
 
 Provides two transport implementations:
 
@@ -14,11 +14,12 @@ Provides two transport implementations:
 import asyncio
 import logging
 import threading
+import time
 from typing import Dict, List, Optional
 
 import httpx
 
-from agentguard.models import ExecutionEvent, ThresholdConfig
+from vex.models import ExecutionEvent, ThresholdConfig
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +30,19 @@ class AsyncTransport:
     Parameters
     ----------
     api_url:
-        Base URL of the Ingestion API (e.g. ``https://api.agentguard.dev``).
+        Base URL of the Ingestion API (e.g. ``https://api.tryvex.dev``).
     api_key:
-        API key sent via the ``X-AgentGuard-Key`` header.
+        API key sent via the ``X-Vex-Key`` header.
     flush_interval_s:
-        Maximum seconds between automatic flushes (used by the Guard client's
+        Maximum seconds between automatic flushes (used by the Vex client's
         periodic flush loop; this class itself does not start a timer).
     flush_batch_size:
         Number of buffered events that triggers an immediate flush.
     timeout_s:
         HTTP request timeout in seconds.
+    max_buffer_size:
+        Maximum number of events that can be buffered. When full, new events
+        are dropped with a warning. Prevents OOM when the API is unavailable.
     """
 
     def __init__(
@@ -48,16 +52,19 @@ class AsyncTransport:
         flush_interval_s: float = 1.0,
         flush_batch_size: int = 50,
         timeout_s: float = 2.0,
+        max_buffer_size: int = 10000,
     ) -> None:
         self.api_url: str = api_url.rstrip("/")
         self.api_key: str = api_key
         self.flush_interval_s: float = flush_interval_s
         self.flush_batch_size: int = flush_batch_size
         self.timeout_s: float = timeout_s
+        self.max_buffer_size: int = max_buffer_size
 
         self._buffer: List[ExecutionEvent] = []
         self._lock: threading.Lock = threading.Lock()
         self._client: Optional[httpx.AsyncClient] = None
+        self._dropped_count: int = 0
 
     # ------------------------------------------------------------------
     # Lazy client initialisation
@@ -67,8 +74,9 @@ class AsyncTransport:
         """Return the shared ``httpx.AsyncClient``, creating it on first use."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                timeout=self.timeout_s,
-                headers={"X-AgentGuard-Key": self.api_key},
+                timeout=httpx.Timeout(connect=5.0, read=self.timeout_s, write=10.0, pool=5.0),
+                headers={"X-Vex-Key": self.api_key},
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
             )
         return self._client
 
@@ -82,8 +90,20 @@ class AsyncTransport:
         If the buffer size reaches ``flush_batch_size``, an async flush is
         scheduled on the running event loop (best-effort; failures are logged
         and the events remain in the buffer for the next flush cycle).
+
+        If the buffer is full (``max_buffer_size``), the event is dropped
+        and a warning is logged every 100 dropped events to avoid log spam.
         """
         with self._lock:
+            if len(self._buffer) >= self.max_buffer_size:
+                self._dropped_count += 1
+                if self._dropped_count % 100 == 1:
+                    logger.warning(
+                        "Buffer full (%d events), dropping event (total dropped: %d)",
+                        self.max_buffer_size,
+                        self._dropped_count,
+                    )
+                return
             self._buffer.append(event)
             should_flush = len(self._buffer) >= self.flush_batch_size
 
@@ -103,8 +123,17 @@ class AsyncTransport:
     async def flush(self) -> None:
         """Send all buffered events as a batch POST to the Ingestion API.
 
-        On success the buffer is cleared.  On failure the events are put back
-        into the buffer so they can be retried on the next flush cycle.
+        Retries up to 3 times with exponential backoff (0.1s, 0.2s, 0.4s) for
+        server errors (5xx) and network errors. Client errors (4xx) are not
+        retried as they indicate permanent failures.
+
+        On success the buffer is cleared. After all retries are exhausted,
+        events are put back into the buffer so they can be retried on the next
+        flush cycle.
+
+        When retrying, respects ``max_buffer_size``: if the buffer is already
+        partially full, only the events that fit are returned, and the rest
+        are dropped with a warning.
         """
         with self._lock:
             if not self._buffer:
@@ -115,25 +144,77 @@ class AsyncTransport:
         payload = [event.model_dump(mode="json") for event in batch]
         url = f"{self.api_url}/v1/ingest/batch"
 
-        try:
-            client = self._get_client()
-            response = await client.post(url, json={"events": payload})
-            response.raise_for_status()
-            logger.debug(
-                "Flushed %d events to %s (status %d)",
-                len(batch),
-                url,
-                response.status_code,
-            )
-        except Exception:
-            # Put events back for retry
-            logger.warning(
-                "Failed to flush %d events; returning to buffer for retry",
-                len(batch),
-                exc_info=True,
-            )
-            with self._lock:
-                self._buffer = batch + self._buffer
+        max_retries = 3
+        base_delay = 0.1
+
+        for attempt in range(max_retries):
+            try:
+                client = self._get_client()
+                response = await client.post(url, json={"events": payload})
+                response.raise_for_status()
+                logger.debug(
+                    "Flushed %d events to %s (status %d)",
+                    len(batch),
+                    url,
+                    response.status_code,
+                )
+                return  # Success - exit without putting events back
+            except httpx.HTTPStatusError as e:
+                # Client errors (4xx) are permanent - don't retry, don't re-buffer
+                if e.response.status_code < 500:
+                    logger.warning(
+                        "Client error %d on flush; dropping %d events (not retrying)",
+                        e.response.status_code,
+                        len(batch),
+                    )
+                    return  # Don't put events back in buffer
+                # Server errors (5xx) are transient - retry with backoff
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "Server error %d on flush (attempt %d/%d); retrying in %.2fs",
+                        e.response.status_code,
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.warning(
+                        "Server error %d on flush after %d attempts; returning to buffer",
+                        e.response.status_code,
+                        max_retries,
+                        exc_info=True,
+                    )
+            except Exception as e:
+                # Network errors and other exceptions - retry with backoff
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "Network error on flush (attempt %d/%d); retrying in %.2fs: %s",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        type(e).__name__,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.warning(
+                        "Failed to flush %d events after %d attempts; returning to buffer",
+                        len(batch),
+                        max_retries,
+                        exc_info=True,
+                    )
+
+        # All retries exhausted - put events back in buffer
+        with self._lock:
+            available_space = max(0, self.max_buffer_size - len(self._buffer))
+            events_to_retry = batch[:available_space]
+            dropped = len(batch) - len(events_to_retry)
+            if dropped > 0:
+                self._dropped_count += dropped
+                logger.warning("Dropped %d events due to buffer overflow on retry", dropped)
+            self._buffer = events_to_retry + self._buffer
 
     async def close(self) -> None:
         """Flush remaining events and close the underlying HTTP client."""
@@ -153,16 +234,16 @@ class SyncTransport:
     - A *correction* client (``correction_timeout_s``, default 90 s) used when
       the caller requests server-side correction (``correction != "none"``).
       The longer timeout accounts for the correction cascade which involves
-      verify → correct → re-verify loops on the gateway side.  This client
+      verify -> correct -> re-verify loops on the gateway side.  This client
       is created lazily on first use.
 
     Parameters
     ----------
     api_url:
         Base URL of the Sync Verification Gateway
-        (e.g. ``https://api.agentguard.dev``).
+        (e.g. ``https://api.tryvex.dev``).
     api_key:
-        API key sent via the ``X-AgentGuard-Key`` header.
+        API key sent via the ``X-Vex-Key`` header.
     timeout_s:
         HTTP request timeout in seconds for normal verification.
     correction_timeout_s:
@@ -182,8 +263,9 @@ class SyncTransport:
         self.correction_timeout_s: float = correction_timeout_s
 
         self._client: httpx.Client = httpx.Client(
-            timeout=self.timeout_s,
-            headers={"X-AgentGuard-Key": self.api_key},
+            timeout=httpx.Timeout(connect=5.0, read=self.timeout_s, write=10.0, pool=5.0),
+            headers={"X-Vex-Key": self.api_key},
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         )
         self._correction_client: Optional[httpx.Client] = None
 
@@ -195,8 +277,9 @@ class SyncTransport:
         """Return the correction client with longer timeout, creating on first use."""
         if self._correction_client is None or self._correction_client.is_closed:
             self._correction_client = httpx.Client(
-                timeout=self.correction_timeout_s,
-                headers={"X-AgentGuard-Key": self.api_key},
+                timeout=httpx.Timeout(connect=5.0, read=self.correction_timeout_s, write=10.0, pool=5.0),
+                headers={"X-Vex-Key": self.api_key},
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
             )
         return self._correction_client
 
@@ -221,6 +304,10 @@ class SyncTransport:
         (``correction_timeout_s``) to accommodate the server-side correction
         loop.  The *correction* and *transparency* values are forwarded in
         the payload metadata.
+
+        Retries up to 3 times with exponential backoff (0.1s, 0.2s, 0.4s) for
+        network errors. HTTP errors (4xx/5xx) are raised immediately without
+        retry, as the caller must handle them (e.g., block on low confidence).
 
         Parameters
         ----------
@@ -256,10 +343,45 @@ class SyncTransport:
         # Select the appropriate client based on correction mode
         client = self._get_correction_client() if correction != "none" else self._client
 
-        response = client.post(url, json=payload)
-        response.raise_for_status()
-        result: Dict[str, object] = response.json()
-        return result
+        max_retries = 3
+        base_delay = 0.1
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            try:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                result: Dict[str, object] = response.json()
+                return result
+            except httpx.HTTPStatusError:
+                # HTTP errors (4xx/5xx) should be raised immediately
+                # The caller needs to handle these (e.g., block on low confidence)
+                raise
+            except Exception as e:
+                # Network errors - retry with backoff
+                last_exception = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "Network error on verify (attempt %d/%d); retrying in %.2fs: %s",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        type(e).__name__,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "Failed to verify after %d attempts",
+                        max_retries,
+                        exc_info=True,
+                    )
+
+        # All retries exhausted - raise the last exception
+        if last_exception is not None:
+            raise last_exception
+        # This should never happen, but satisfy the type checker
+        raise RuntimeError("verify() failed without setting last_exception")
 
     def close(self) -> None:
         """Close the underlying HTTP clients."""
